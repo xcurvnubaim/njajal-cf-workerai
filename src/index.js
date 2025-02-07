@@ -85,51 +85,10 @@ app.get('/', async (c) => {
 
 app.post('/notes', async (c) => {
 	const { text } = await c.req.parseBody();
-	if (!text) {
-		return c.text('Missing text', 400);
-	}
-
-	let texts = await step.do('split text', async () => {
-		const splitter = new RecursiveCharacterTextSplitter();
-		const output = await splitter.createDocuments([text]);
-		return output.map(doc => doc.pageContent);
-	})
-
-	console.log(`RecursiveCharacterTextSplitter generated ${texts.length} chunks`)
-
-	for (const index in texts) {
-		const text = texts[index]
-		const record = await step.do(`create database record: ${index}/${texts.length}`, async () => {
-			const query = "INSERT INTO notes (text) VALUES (?) RETURNING *"
-
-			const { results } = await env.DATABASE.prepare(query)
-			.bind(text)
-			.run()
-
-			const record = results[0]
-			if (!record) throw new Error("Failed to create note")
-			return record;
-		})
-	}
-
-	const embedding = await step.do(`generate embedding: ${index}/${texts.length}`, async () => {
-		const embeddings = await env.AI.run('@cf/baai/bge-base-en-v1.5', { text: text })
-		const values = embeddings.data[0]
-		if (!values) throw new Error("Failed to generate vector embedding")
-		return values
-	});
-
-	await step.do(`insert vector: ${index}/${texts.length}`, async () => {
-		return env.VECTOR_INDEX.upsert([
-		{
-			id: record.id.toString(),
-			values: embedding,
-		}
-		]);
-	});
-
-	return c.json({ id, text, inserted });
-});
+	if (!text) return c.text("Missing text", 400);
+	await c.env.RAG_WORKFLOW.create({ params: { text } })
+	return c.text("Created note", 201);
+})
 
 app.delete('/notes/:id', async (c) => {
 	const { id } = c.req.param();
@@ -147,3 +106,56 @@ app.onError((err, c) => {
 });
 
 export default app;
+
+export class RAGWorkflow {
+	async run(event, step) {
+		const env = this.env
+		const { text } = event.payload;
+		let texts = [text]
+
+		if (env.ENABLE_TEXT_SPLITTING) {
+			texts = await step.do('split text', async () => {
+				const splitter = new RecursiveCharacterTextSplitter({
+					// These can be customized to change the chunking size
+					//chunkSize: 1000,
+					//chunkOverlap: 200,
+				});
+				const output = await splitter.createDocuments([text]);
+				return output.map(doc => doc.pageContent);
+			})
+
+			console.log("RecursiveCharacterTextSplitter generated ${texts.length} chunks")
+		}
+
+		for (const index in texts) {
+			const text = texts[index]
+			const record = await step.do(`create database record: ${index}/${texts.length}`, async () => {
+				const query = "INSERT INTO notes (text) VALUES (?) RETURNING *"
+
+				const { results } = await env.DATABASE.prepare(query)
+					.bind(text)
+					.run()
+
+				const record = results[0]
+				if (!record) throw new Error("Failed to create note")
+				return record;
+			})
+
+			const embedding = await step.do(`generate embedding: ${index}/${texts.length}`, async () => {
+				const embeddings = await env.AI.run('@cf/baai/bge-base-en-v1.5', { text: text })
+				const values = embeddings.data[0]
+				if (!values) throw new Error("Failed to generate vector embedding")
+				return values
+			})
+
+			await step.do(`insert vector: ${index}/${texts.length}`, async () => {
+				return env.VECTOR_INDEX.upsert([
+					{
+						id: record.id.toString(),
+						values: embedding,
+					}
+				]);
+			})
+		}
+	}
+}
